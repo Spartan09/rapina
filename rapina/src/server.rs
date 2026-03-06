@@ -11,7 +11,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
-use tokio::signal::unix::SignalKind;
 
 use crate::context::RequestContext;
 use crate::middleware::MiddlewareStack;
@@ -35,8 +34,21 @@ pub(crate) async fn serve(
     let listener = TcpListener::bind(addr).await?;
     let graceful = GracefulShutdown::new();
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
-    let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+
+    let mut sigterm: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            tokio::signal::unix::signal(SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+    });
 
     tracing::info!("Rapina listening on http://{}", addr);
 
@@ -79,7 +91,8 @@ pub(crate) async fn serve(
                 tracing::info!("Shutdown signal received, waiting for connections to drain...");
                 break;
             }
-            _ = sigterm.recv() => {
+
+            _ = sigterm.as_mut()  => {
                 drop(listener);
                 tracing::info!("Shutdown signal received, waiting for connections to drain...");
                 break;
@@ -109,8 +122,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::getpid;
     use serial_test::serial;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -135,12 +146,29 @@ mod tests {
         String::from_utf8_lossy(&buf).to_string()
     }
 
-    fn send_sigint() {
-        kill(getpid(), Signal::SIGINT).unwrap();
+    #[cfg(unix)]
+    mod unix_tests {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::getpid;
+
+        pub(super) fn send_sigint() {
+            kill(getpid(), Signal::SIGINT).unwrap();
+        }
+
+        pub(super) fn send_sigterm() {
+            kill(getpid(), Signal::SIGTERM).unwrap();
+        }
     }
 
-    fn send_sigterm() {
-        kill(getpid(), Signal::SIGTERM).unwrap();
+    #[cfg(windows)]
+    mod windows_tests {
+        use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
+        pub(super) fn send_ctrl_break() {
+            unsafe {
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -179,7 +207,11 @@ mod tests {
         let response = http_get(port, "/").await;
         assert!(response.contains("200"), "server should respond with 200");
 
-        send_sigint();
+        #[cfg(unix)]
+        unix_tests::send_sigint();
+
+        #[cfg(windows)]
+        windows_tests::send_ctrl_break();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "server should shut down within timeout");
@@ -220,7 +252,12 @@ mod tests {
         let response_task = tokio::spawn(async move { http_get(port, "/slow").await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        send_sigint();
+
+        #[cfg(unix)]
+        unix_tests::send_sigint();
+
+        #[cfg(windows)]
+        windows_tests::send_ctrl_break();
 
         let response = tokio::time::timeout(Duration::from_secs(5), response_task)
             .await
@@ -261,7 +298,12 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        send_sigint();
+
+        #[cfg(unix)]
+        unix_tests::send_sigint();
+
+        #[cfg(windows)]
+        windows_tests::send_ctrl_break();
 
         let result = tokio::time::timeout(Duration::from_secs(3), handle).await;
         assert!(
@@ -291,7 +333,11 @@ mod tests {
         let response = http_get(port, "/").await;
         assert!(response.contains("200"), "server should respond with 200");
 
-        send_sigterm();
+        #[cfg(unix)]
+        unix_tests::send_sigterm();
+
+        #[cfg(windows)]
+        windows_tests::send_ctrl_break();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "server should shut down within timeout");
